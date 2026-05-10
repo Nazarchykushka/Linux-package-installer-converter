@@ -108,7 +108,7 @@ As the program is only in pre-release stage, the author does not accept any dona
 
 ## How the Program Works
 
-<video src="https://github.com/Nazarchykushka/Linux-package-installer-converter/blob/main/logo/demonstration.mp4" autoplay muted playsinline width="100%"></video>
+![Demonstration](https://raw.githubusercontent.com/Nazarchykushka/Linux-package-installer-converter/main/logo/demonstration.gif)
 
 This video demonstrates what the program installation looks like.
 
