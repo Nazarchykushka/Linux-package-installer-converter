@@ -41,7 +41,7 @@ Arch Linux graphical open-source utility that helps you install `.deb`, `.rpm` a
 
 ## How the Program Works
 
-![Demonstration](https://raw.githubusercontent.com/Nazarchykushka/Linux-package-installer-converter/main/demonstration.gif)
+![Demonstration](https://raw.githubusercontent.com/Nazarchykushka/Linux-package-installer-converter/main/demonstrationvideo.gif)
 
 This video demonstrates what the program installation looks like.
 
