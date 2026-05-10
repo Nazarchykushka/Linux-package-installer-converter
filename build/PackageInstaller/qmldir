@@ -1,0 +1,6 @@
+module PackageInstaller
+typeinfo appPackageInstaller.qmltypes
+prefer :/PackageInstaller/
+Main 1.0 Main.qml
+depends QtQuick
+

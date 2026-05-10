@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="/PackageInstaller">/home/naz/PackageInstaller/build/PackageInstaller</file>
+
+  </qresource>
+</RCC>
