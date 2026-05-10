@@ -148,4 +148,4 @@ It uses [debtap](https://github.com/helixarch/debtap) and rpmtap (modified debta
 
 ## Support
 
-As the program is only in pre-release stage, the author does not accept any donations. But all the translations except Ukrainian, Russian and English were partially made by Gemini, so if you know other languages, you can suggest improvements in the Reddit discussion or suggest your language translation. You can download the reference translation file [here](#). To ensure it works, download the source code, add your `.ts` file to the `translations` folder and compile the program.
+As the program is only in pre-release stage, the author does not accept any donations. But all the translations except Ukrainian, Russian and English were partially made by Gemini, so if you know other languages, you can suggest improvements in the Reddit discussion or suggest your language translation. You can download the reference translation file [here](https://github.com/Nazarchykushka/Linux-package-installer-converter/raw/main/translations_reference.ts). To ensure it works, download the source code, add your `.ts` file to the `translations` folder and compile the program.
