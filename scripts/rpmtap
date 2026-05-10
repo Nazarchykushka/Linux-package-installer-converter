@@ -1,0 +1,1141 @@
+#!/usr/bin/env bash
+# rpmtap — convert RPM packages to Arch Linux .pkg.tar.zst
+# Based on debtap (AI mode) — adapted for RPM input
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+Version="3.4.0-ai-rpm"
+
+# ============================================================
+# AI CONFIGURATION
+# Reads provider + key from ~/.cache/LinuxAppInstallerConfig/
+# matching the C++ backend logic exactly.
+# ============================================================
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+CONFIG_DIR="$HOME/.cache/LinuxAppInstallerConfig"
+
+# --- Read provider (default: openrouter) ---
+if [[ -n "$AI_PROVIDER" ]]; then
+    : # passed via env by C++ backend
+elif [[ -f "$CONFIG_DIR/ai_provider.txt" ]]; then
+    AI_PROVIDER="$(cat "$CONFIG_DIR/ai_provider.txt" | tr -d '[:space:]')"
+else
+    AI_PROVIDER="openrouter"
+fi
+
+# --- Read model (optional, each provider has its own default) ---
+if [[ -z "$AI_MODEL" ]] && [[ -f "$CONFIG_DIR/ai_model.txt" ]]; then
+    AI_MODEL="$(cat "$CONFIG_DIR/ai_model.txt" | tr -d '[:space:]')"
+fi
+
+# --- Read API key based on provider ---
+if [[ -z "$AI_TOKEN" ]]; then
+    case "$AI_PROVIDER" in
+        gemini)
+            [[ -f "$CONFIG_DIR/gemini_token.txt" ]]      && AI_TOKEN="$(cat "$CONFIG_DIR/gemini_token.txt"      | tr -d '[:space:]')" ;;
+        openai)
+            [[ -f "$CONFIG_DIR/openai_token.txt" ]]      && AI_TOKEN="$(cat "$CONFIG_DIR/openai_token.txt"      | tr -d '[:space:]')" ;;
+        huggingface)
+            [[ -f "$CONFIG_DIR/huggingface_token.txt" ]] && AI_TOKEN="$(cat "$CONFIG_DIR/huggingface_token.txt" | tr -d '[:space:]')" ;;
+        mistral)
+            [[ -f "$CONFIG_DIR/mistral_token.txt" ]]     && AI_TOKEN="$(cat "$CONFIG_DIR/mistral_token.txt"     | tr -d '[:space:]')" ;;
+        openrouter|*)
+            AI_PROVIDER="openrouter"
+            if [[ -n "$OPENROUTER_API_KEY" ]]; then
+                AI_TOKEN="$OPENROUTER_API_KEY"
+            elif [[ -f "$CONFIG_DIR/token.txt" ]]; then
+                AI_TOKEN="$(cat "$CONFIG_DIR/token.txt" | tr -d '[:space:]')"
+            elif [[ -f "$SCRIPT_DIR/token.txt" ]]; then
+                AI_TOKEN="$(cat "$SCRIPT_DIR/token.txt" | tr -d '[:space:]')"
+            fi
+            ;;
+    esac
+fi
+
+OPENROUTER_API_KEY="$AI_TOKEN"
+AI_TRANSLATOR="$SCRIPT_DIR/debtap-ai-translator.py"
+
+NO_AI=0
+[[ "$SKIP_AI" == "1" ]] && NO_AI=1
+for i in "$@"; do
+    [[ "$i" == "-noai" ]] && NO_AI=1
+done
+
+# ============================================================
+
+# Colors
+lightgreen='\e[1;32m'
+lightred='\e[1;31m'
+red='\e[0;31m'
+lightblue='\e[1;34m'
+NC='\e[0m'
+bold=$(tput bold)
+normal=$(tput sgr0)
+
+ai_request() {
+    local system_prompt="$1"
+    local user_msg="$2"
+    local response http_code
+
+    if [[ $NO_AI -eq 1 ]] || [[ -z "$AI_TOKEN" ]]; then
+        return 1
+    fi
+
+    case "$AI_PROVIDER" in
+        gemini)
+            local model="${AI_MODEL:-gemini-2.5-flash}"
+            local url="https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${AI_TOKEN}"
+            local body
+            body=$(printf '{"contents":[{"role":"user","parts":[{"text":"%s\n\n%s"}]}],"generationConfig":{"temperature":0,"maxOutputTokens":1024}}' \
+                "$(echo "$system_prompt" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read())[1:-1])')" \
+                "$(echo "$user_msg"      | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read())[1:-1])')")
+            local tmpfile; tmpfile=$(mktemp)
+            http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
+                -X POST "$url" \
+                -H "Content-Type: application/json" \
+                -d "$body")
+            if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then rm -f "$tmpfile"; return 4; fi
+            if [[ "$http_code" != "200" ]]; then rm -f "$tmpfile"; return 1; fi
+            response=$(python3 -c "
+import sys, json
+try:
+    d = json.load(open('$tmpfile'))
+    print(d['candidates'][0]['content']['parts'][0]['text'])
+except: pass
+")
+            rm -f "$tmpfile"
+            echo "$response"
+            ;;
+        openai)
+            local model="${AI_MODEL:-gpt-4o-mini}"
+            local body
+            body=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': '$model',
+    'max_tokens': 1024,
+    'temperature': 0,
+    'messages': [
+        {'role': 'system', 'content': sys.argv[1]},
+        {'role': 'user',   'content': sys.argv[2]}
+    ]
+}))" "$system_prompt" "$user_msg")
+            local tmpfile; tmpfile=$(mktemp)
+            http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
+                -X POST "https://api.openai.com/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $AI_TOKEN" \
+                -d "$body")
+            if [[ "$http_code" == "401" ]]; then rm -f "$tmpfile"; return 4; fi
+            if [[ "$http_code" != "200" ]]; then rm -f "$tmpfile"; return 1; fi
+            response=$(python3 -c "
+import json
+d = json.load(open('$tmpfile'))
+print(d['choices'][0]['message']['content'])
+")
+            rm -f "$tmpfile"
+            echo "$response"
+            ;;
+        huggingface)
+            local model="${AI_MODEL:-meta-llama/Llama-3.2-3B-Instruct}"
+            local body
+            body=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': '$model',
+    'max_tokens': 1024,
+    'temperature': 0,
+    'messages': [
+        {'role': 'system', 'content': sys.argv[1]},
+        {'role': 'user',   'content': sys.argv[2]}
+    ]
+}))" "$system_prompt" "$user_msg")
+            local tmpfile; tmpfile=$(mktemp)
+            http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
+                -X POST "https://router.huggingface.co/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $AI_TOKEN" \
+                -d "$body")
+            if [[ "$http_code" == "401" ]]; then rm -f "$tmpfile"; return 4; fi
+            if [[ "$http_code" != "200" ]]; then rm -f "$tmpfile"; return 1; fi
+            response=$(python3 -c "
+import json
+d = json.load(open('$tmpfile'))
+print(d['choices'][0]['message']['content'])
+")
+            rm -f "$tmpfile"
+            echo "$response"
+            ;;
+        mistral)
+            local model="${AI_MODEL:-mistral-small-latest}"
+            local body
+            body=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': '$model',
+    'max_tokens': 1024,
+    'temperature': 0,
+    'messages': [
+        {'role': 'system', 'content': sys.argv[1]},
+        {'role': 'user',   'content': sys.argv[2]}
+    ]
+}))" "$system_prompt" "$user_msg")
+            local tmpfile; tmpfile=$(mktemp)
+            http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
+                -X POST "https://api.mistral.ai/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $AI_TOKEN" \
+                -d "$body")
+            if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then rm -f "$tmpfile"; return 4; fi
+            if [[ "$http_code" != "200" ]]; then rm -f "$tmpfile"; return 1; fi
+            response=$(python3 -c "
+import json
+d = json.load(open('$tmpfile'))
+print(d['choices'][0]['message']['content'])
+")
+            rm -f "$tmpfile"
+            echo "$response"
+            ;;
+        openrouter|*)
+            local model="${AI_MODEL:-google/gemma-4-31b-it:free}"
+            local body
+            body=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': '$model',
+    'max_tokens': 1024,
+    'temperature': 0,
+    'messages': [
+        {'role': 'system', 'content': sys.argv[1]},
+        {'role': 'user',   'content': sys.argv[2]}
+    ]
+}))" "$system_prompt" "$user_msg")
+            local tmpfile; tmpfile=$(mktemp)
+            http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
+                -X POST "https://openrouter.ai/api/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $AI_TOKEN" \
+                -H "HTTP-Referer: https://github.com/PackageInstaller" \
+                -H "X-Title: PackageInstaller" \
+                -d "$body")
+            if [[ "$http_code" == "401" || "$http_code" == "402" ]]; then rm -f "$tmpfile"; return 4; fi
+            if [[ "$http_code" != "200" ]]; then rm -f "$tmpfile"; return 1; fi
+            response=$(python3 -c "
+import json
+d = json.load(open('$tmpfile'))
+print(d['choices'][0]['message']['content'])
+")
+            rm -f "$tmpfile"
+            echo "$response"
+            ;;
+    esac
+}
+
+check_ai_translator() {
+    [[ $NO_AI -eq 1 ]] && return 0
+    if [[ ! -f "$AI_TRANSLATOR" ]]; then
+        echo -e "${red}Error: AI translator not found at: $AI_TRANSLATOR${NC}"
+        exit 1
+    fi
+    if ! python3 -c "import rapidfuzz" 2>/dev/null; then
+        echo -e "${red}Error: Python package 'rapidfuzz' is not installed.${NC}"
+        exit 1
+    fi
+    if [[ "$AI_PROVIDER" != "gemini" ]]; then
+        if ! python3 -c "import openai" 2>/dev/null; then
+            echo -e "${red}Error: Python package 'openai' is not installed.${NC}"
+            exit 1
+        fi
+    fi
+}
+
+check_rpm_tools() {
+    local missing=()
+    for tool in rpm rpm2cpio cpio; do
+        if ! command -v "$tool" &>/dev/null; then
+            missing+=("$tool")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${red}Error: Missing required tools: ${missing[*]}${NC}"
+        echo -e "${red}Install them with: sudo pacman -S rpm-tools${NC}"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Option parsing
+# ---------------------------------------------------------------------------
+optionsarray=()
+for i in "$@"; do
+    optionsarray+=($@)
+    if [[ "$i" =~ ^-([huqQswpPv]*)h([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--help$ ]]; then help=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)u([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--update$ ]]; then update=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)q([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--quiet$ ]]; then quiet=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)Q([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--Quiet$ ]]; then Quiet=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)w([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--wipeout$ ]]; then wipeout=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)p([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--pkgbuild$ ]]; then pkgbuild=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)P([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--Pkgbuild$ ]]; then Pkgbuild=set; fi
+    if [[ "$i" =~ ^-([huqQswpPv]*)v([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--version$ ]]; then version=set; fi
+    if [[ "$i" =~ ^-o$ ]] || [[ "$i" =~ ^--output$ ]]; then output=set; fi
+done
+
+if [[ $output == set ]]; then
+    for i in $(eval echo {0..$((${#optionsarray[@]}-1))}); do
+        if [[ "${optionsarray[$i]}" =~ ^-o$ ]] || [[ "${optionsarray[$i]}" =~ ^--output$ ]]; then
+            if [[ "${optionsarray[$i+1]}" == "" ]]; then
+                echo -e "${red}Error: You haven't specified an output directory${NC}"; exit 1
+            elif [ -d "${optionsarray[$i+1]}" ]; then
+                outputdirectory="$(realpath "${optionsarray[$i+1]}")"
+            else
+                echo -e "${red}Error: No output directory or invalid output directory${NC}"; exit 1
+            fi
+        fi
+    done
+fi
+
+if [[ $help == set ]]; then
+    echo -e "rpmtap — RPM to Arch Linux package converter (AI mode)\n"
+    echo -e "Syntax: rpmtap -o output_directory [other_options] package_filename\n"
+    echo -e "Options:\n"
+    echo -e "    -h  --help        Print this help message"
+    echo -e "    -u  --update      No-op in AI mode (no database needed)"
+    echo -e "    -q  --quiet       Bypass all questions, except for editing metadata file(s)"
+    echo -e "    -Q  --Quiet       Bypass all questions (not recommended)"
+    echo -e "    -w  --wipeout     Wipeout versions from all dependencies, conflicts etc."
+    echo -e "    -p  --pkgbuild    Additionally generate a PKGBUILD file"
+    echo -e "    -P  --Pkgbuild    Generate a PKGBUILD file only"
+    echo -e "    -o  --output      Output directory for generated package and/or PKGBUILD (optional)"
+    echo -e "    -v  --version     Print version\n"
+    echo -e "AI providers supported: openrouter, gemini, openai, huggingface, mistral"
+    echo -e "Provider/key read from: ~/.cache/LinuxAppInstallerConfig/{ai_provider,ai_model,*_token}.txt"
+    exit 0
+elif [[ $version == set ]]; then
+    echo -e "$Version"; exit 0
+elif [[ $update == set ]]; then
+    echo -e "${lightblue}Note:${NC} ${bold}This is the AI-powered rpmtap. The -u/--update flag is not needed${normal}"
+    exit 0
+fi
+
+# Validate package argument
+last_arg="${@: -1}"
+
+if [[ "$last_arg" == "rpmtap" ]] || [[ "$last_arg" =~ /rpmtap$ ]] || \
+   [[ "$last_arg" =~ ^-([qQswpPo]+)$ ]] || [[ -d "$last_arg" ]]; then
+    echo -e "${red}Error: You haven't specified an RPM package${NC}"
+    echo -e "Syntax: rpmtap -o output_directory [other_options] package_filename"
+    exit 1
+fi
+
+if [[ ! -f "$last_arg" ]]; then
+    echo -e "${red}Error: No such file or directory or invalid option${NC}"; exit 1
+fi
+
+if ! file -S -b "$last_arg" | grep -qi "RPM\|rpm"; then
+    if [[ ! "$last_arg" =~ \.rpm$ ]]; then
+        echo -e "${red}Error: You haven't specified a valid RPM package${NC}"; exit 1
+    fi
+fi
+
+echo -e "${lightblue}::${NC} AI provider: ${bold}${AI_PROVIDER}${normal}, model: ${bold}${AI_MODEL:-default}${normal}"
+
+check_ai_translator
+check_rpm_tools
+
+# ---------------------------------------------------------------------------
+# Helper: query RPM metadata
+# ---------------------------------------------------------------------------
+rpm_query() {
+    rpm -qp --queryformat "$2" "$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Set up working directory
+# ---------------------------------------------------------------------------
+package_with_full_path="$(readlink -f "$last_arg")"
+pkg_basename="$(basename "$last_arg" | tr '[:upper:]' '[:lower:]' | sed 's/\.rpm$//')"
+working_directory="$HOME/.cache/${pkg_basename}-working-directory"
+
+rm -rf "$working_directory" 2>/dev/null
+mkdir "$working_directory" 2>/dev/null
+if [[ $? != 0 ]]; then
+    echo -e "${red}Error: Cannot create working directory, permission denied. Exiting...${NC}"
+    exit 1
+fi
+cd "$working_directory"
+
+# ---------------------------------------------------------------------------
+# Extract RPM payload
+# ---------------------------------------------------------------------------
+echo -e "${lightgreen}==>${NC} ${bold}Extracting package data...${normal}"
+
+rpm2cpio "$package_with_full_path" | bsdtar -xf - 2>/dev/null
+touch "$HOME/.cache/extract_done"
+if [[ $? != 0 ]]; then
+    echo -e "${red}Error: Failed to extract RPM package.${NC}"
+    rm -rf "$working_directory"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Extract RPM scripts
+# ---------------------------------------------------------------------------
+rpm -qp --scripts "$package_with_full_path" 2>/dev/null > _rpm_scripts_raw
+
+awk '
+    /^preinstall scriptlet \(using \/bin\/sh\):/ { section="preinst"; next }
+    /^postinstall scriptlet \(using \/bin\/sh\):/ { section="postinst"; next }
+    /^preuninstall scriptlet \(using \/bin\/sh\):/ { section="prerm"; next }
+    /^postuninstall scriptlet \(using \/bin\/sh\):/ { section="postrm"; next }
+    /^[a-z]+ scriptlet/ { section=""; next }
+    section != "" { print > section }
+' _rpm_scripts_raw 2>/dev/null
+
+rm -f _rpm_scripts_raw
+
+# ---------------------------------------------------------------------------
+# Extract conffiles list
+# ---------------------------------------------------------------------------
+rpm -qp --configfiles "$package_with_full_path" 2>/dev/null \
+    | sed 's|^/||' | sort -u > conffiles_list
+
+# ---------------------------------------------------------------------------
+# Fix filesystem hierarchy
+# ---------------------------------------------------------------------------
+echo -e "${lightgreen}==>${NC} ${bold}Fixing possible directory structure differences...${normal}"
+
+if [[ -e usr/games ]]; then mkdir -p usr/bin 2>/dev/null; mv usr/games/* usr/bin; rm -rf usr/games; fi
+if [[ -e bin ]]; then mkdir -p usr/bin 2>/dev/null; mv bin/* usr/bin; rm -rf bin; fi
+if [[ -e sbin ]]; then mkdir -p usr/bin 2>/dev/null; mv sbin/* usr/bin; rm -rf sbin; fi
+if [[ -e usr/sbin ]]; then mkdir -p usr/bin 2>/dev/null; mv usr/sbin/* usr/bin; rm -rf usr/sbin; fi
+if [[ -e usr/local/games ]]; then mkdir -p usr/bin 2>/dev/null; mv usr/local/games/* usr/bin; rm -rf usr/local/games; fi
+if [[ -e usr/local/bin ]]; then mkdir -p usr/bin 2>/dev/null; mv usr/local/bin/* usr/bin; rm -rf usr/local/bin; fi
+if [[ -e usr/local/sbin ]]; then mkdir -p usr/bin 2>/dev/null; mv usr/local/sbin/* usr/bin; rm -rf usr/local/sbin; fi
+if [[ -e lib ]]; then mkdir -p usr/lib 2>/dev/null; mv lib/* usr/lib; rm -rf lib; fi
+if [[ -e lib64 ]]; then mkdir -p usr/lib 2>/dev/null; mv lib64/* usr/lib; rm -rf lib64; fi
+if [[ -e usr/lib64 ]]; then mkdir -p usr/lib 2>/dev/null; mv usr/lib64/* usr/lib; rm -rf usr/lib64; fi
+if [[ -e usr/local ]] && [[ ! $(ls -A usr/local 2>/dev/null) ]]; then rm -rf usr/local; fi
+
+if [[ -e usr/share/applications ]]; then
+    ls usr/share/applications/*.desktop 2>/dev/null | while read line; do
+        sed -i \
+            -e 's|^Exec=/bin/|Exec=/usr/bin/|g' \
+            -e 's|^Exec=/sbin/|Exec=/usr/bin/|g' \
+            -e 's|^Exec=/usr/sbin/|Exec=/usr/bin/|g' \
+            -e 's|^Exec=/usr/games/|Exec=/usr/bin/|g' \
+            -e 's|^Exec=/usr/local/bin/|Exec=/usr/bin/|g' \
+            -e 's|^Exec=/usr/local/sbin/|Exec=/usr/bin/|g' \
+            "$line" 2>/dev/null
+    done
+fi
+
+# ============================================================
+# AI-POWERED packages-names-translator
+# ============================================================
+packages-names-translator() {
+    local initial_list
+    initial_list=$(ls | grep initial-check-list 2>/dev/null | head -1)
+
+    if [[ -z "$initial_list" ]] || [[ ! -s "$initial_list" ]]; then
+        touch final-check-list
+        return 0
+    fi
+
+    if [[ $NO_AI -eq 1 ]]; then
+        touch final-check-list
+        return 0
+    fi
+
+    if [[ -z "$AI_TOKEN" ]]; then
+        echo -e "${lightblue}   ::${NC} No token — skipping dependency translation" >&2
+        touch final-check-list
+        touch /tmp/debtap-no-token
+        return 0
+    fi
+
+    if [[ ! -f "$AI_TRANSLATOR" ]]; then
+        echo -e "${lightred}Warning: AI translator not found at $AI_TRANSLATOR. Skipping dependency translation.${NC}" >&2
+        touch final-check-list
+        return 0
+    fi
+
+    echo -e "${lightblue}   ::${NC} Calling ${AI_PROVIDER} AI to translate $(wc -l < "$initial_list") package name(s)..." >&2
+
+    local translated_file
+    translated_file=$(mktemp)
+
+    python3 "$AI_TRANSLATOR" \
+        "$AI_TOKEN" \
+        "$initial_list" \
+        "$translated_file"
+    local py_exit=$?
+
+    if [[ $py_exit -eq 4 ]]; then
+        echo -e "${lightred}   :: AI AUTH ERROR: Invalid or missing API token!${NC}" >&2
+        rm -f "$translated_file"
+        touch /tmp/debtap-ai-auth-error
+        touch final-check-list
+        return 0
+    fi
+
+    if [[ $py_exit -ne 0 ]]; then
+        echo -e "${lightred}Warning: AI translator exited with code $py_exit. Skipping.${NC}" >&2
+        rm -f "$translated_file"
+        touch final-check-list
+        return 0
+    fi
+
+    _apply_translation "$initial_list" "$translated_file"
+    rm -f "$translated_file"
+}
+
+_apply_translation() {
+    local initial_list="$1"
+    local translated_file="$2"
+
+    local prefix
+    prefix=$(echo "$initial_list" | sed 's/-initial-check-list//')
+
+    touch final-check-list
+
+    local untranslated_file="${prefix}-untranslated-names-only"
+    touch "$untranslated_file"
+
+    local count_ok=0
+    local count_failed=0
+    local missing_file="${prefix}-missing-files"
+
+    local pkgname_base
+    pkgname_base=$(grep '^pkgname =' .PKGINFO 2>/dev/null | awk '{print $3}' | \
+        sed 's/-svn$\|-git$\|-cvs$\|-bzr$\|-darcs$\|-hg$//')
+
+    mapfile -t orig_lines  < "$initial_list"
+    mapfile -t trans_lines < "$translated_file"
+    local total_lines=${#orig_lines[@]}
+
+    for (( _idx=0; _idx<total_lines; _idx++ )); do
+        local orig_line="${orig_lines[$_idx]}"
+        local trans_line="${trans_lines[$_idx]:-}"
+        orig_name=$(echo "$orig_line" | awk '{print $1}')
+        trans_name=$(echo "$trans_line" | awk '{print $1}')
+
+        [[ -z "$orig_line" ]] && continue
+
+        if [[ -n "$pkgname_base" ]] && [[ "$orig_name" == "$pkgname_base" ]]; then
+            trans_name=""
+            trans_line="$orig_line"
+        fi
+
+        if [[ -n "$trans_name" ]] && ! [[ "$trans_name" =~ ^[a-z0-9][a-z0-9+_.@-]*[a-z0-9+_.@]$ ]]; then
+            trans_name=""
+            trans_line="$orig_line"
+        fi
+
+        if [[ -z "$trans_name" ]]; then
+            echo "$orig_name" >> "$untranslated_file"
+            ((count_failed++))
+            continue
+        fi
+
+        if [[ -n "$pkgname_base" ]] && [[ "$trans_name" == "$pkgname_base" ]]; then
+            echo "$orig_line" >> "$missing_file"
+            ((count_failed++))
+            continue
+        fi
+
+        # --- ЗМІНА 1: зберігаємо processed_line і маппінг ---
+        local processed_line
+        processed_line=$(echo "$trans_line" | \
+            sed -e 's/>=/\x01GE\x01/g' -e 's/<=/\x01LE\x01/g' \
+                -e 's/>/\x01GT\x01/g'  -e 's/</\x01LT\x01/g' \
+                -e 's/=/\x01EQ\x01/g'  -e 's/\x01GE\x01/>=/g' \
+                -e 's/\x01LE\x01/<=/g' -e 's/\x01GT\x01/>/g' \
+                -e 's/\x01LT\x01/</g'  -e 's/\x01EQ\x01/=/g')
+        echo "$processed_line" >> final-check-list
+        # Зберігаємо маппінг: rpm_name=arch_translated_line
+        echo "${orig_name}=${processed_line}" >> "${working_directory}/dep-mapping.txt"
+        # -----------------------------------------------------
+
+        if [[ "$orig_name" != "$trans_name" ]]; then
+            echo -e "${lightblue}   ::${NC} ${orig_name}  ->  ${trans_name}" >&2
+        else
+            echo -e "${lightblue}   ::${NC} ${orig_name}  (already arch)" >&2
+        fi
+        ((count_ok++))
+    done
+
+    local translated_count=0
+    local untranslated_count=0
+    local total_input
+    total_input=$(grep -c . "$initial_list" 2>/dev/null || echo 0)
+    [[ -s final-check-list ]]       && translated_count=$(grep -c . final-check-list 2>/dev/null || echo 0)
+    [[ -s "$untranslated_file" ]]   && untranslated_count=$(grep -c . "$untranslated_file" 2>/dev/null || echo 0)
+
+    touch "$HOME/.cache/convert_done"
+    echo -e "${lightblue}   ::${NC} Translation result: ${lightgreen}${translated_count} translated${NC}, ${lightred}${untranslated_count} failed${NC} (of ${total_input} total)" >&2
+}
+
+parse_rpm_dep_field() {
+    local rpm_flag="$1"
+    local prefix="$2"
+
+    rpm -qp "$rpm_flag" "$package_with_full_path" 2>/dev/null | \
+        grep -v '\.so\b\|\.so\.' | \
+        grep -v '^rpmlib\|^config(\|^rtld(\|^(none)' | \
+        grep -v '^kernel-\|debuginfo\|^ld-linux' | \
+        grep -v '^/bin/\|^/usr/bin/python\|^/usr/bin/perl' | \
+        sed -e 's/ >= />=/' \
+            -e 's/ <= /<= /' \
+            -e 's/ = /=/' \
+            -e 's/ > />/' \
+            -e 's/ < /</' | \
+        sort -u > "${prefix}-initial-check-list"
+
+    [[ $(wc -l < "${prefix}-initial-check-list") -eq 0 ]] && echo >> "${prefix}-initial-check-list"
+
+    packages-names-translator
+
+    if [[ $wipeout != set ]]; then
+        cat final-check-list 2>/dev/null
+    else
+        gawk '{print $1}' final-check-list 2>/dev/null
+    fi
+
+    rm -rf "${prefix}-initial-check-list" final-check-list
+}
+
+# ---------------------------------------------------------------------------
+# Generate .PKGINFO
+# ---------------------------------------------------------------------------
+echo -e "${lightgreen}==>${NC} ${bold}Generating .PKGINFO file...${normal}"
+
+raw_name=$(rpm_query "$package_with_full_path" '%{NAME}')
+pkgname=$(echo "$raw_name" | tr '[:upper:]' '[:lower:]' | sed -e 's/demo$/-demo/' -e 's/trial$/-trial/' -e 's/--/-/g')
+echo "pkgname = $pkgname" > .PKGINFO
+
+raw_ver=$(rpm_query "$package_with_full_path" '%{VERSION}')
+raw_rel=$(rpm_query "$package_with_full_path" '%{RELEASE}')
+clean_rel=$(echo "$raw_rel" | \
+    sed -e 's/\.\(fc\|el\|mga\|suse\|mdv\|pclos\|alt\|omv\|lp\)[0-9][0-9]*$//' \
+        -e 's/\.\(centos\|rhel\|sl\)[0-9]*$//' \
+        -e 's/--/-/g' \
+        -e 's/\.\././g' \
+        -e 's/\.$//')
+pkgver="${raw_ver}.${clean_rel}-1"
+pkgver=$(echo "$pkgver" | sed -e 's/[+~]/-/g' -e 's/--/-/g' -e 's/\.\././g')
+echo "pkgver = $pkgver" >> .PKGINFO
+
+summary=$(rpm_query "$package_with_full_path" '%{SUMMARY}')
+if [[ -z "$summary" ]] || [[ "$summary" == "(none)" ]]; then
+    summary=$(rpm_query "$package_with_full_path" '%{DESCRIPTION}' | head -1)
+fi
+echo "pkgdesc = $summary" >> .PKGINFO
+
+url=$(rpm_query "$package_with_full_path" '%{URL}')
+[[ "$url" == "(none)" ]] && url=""
+echo "url = $url" >> .PKGINFO
+
+echo "builddate = $(date -u '+%s')" >> .PKGINFO
+
+if [[ $quiet == set ]] || [[ $Quiet == set ]]; then
+    echo "packager = Unknown Packager" >> .PKGINFO
+else
+    source /usr/share/makepkg/util/config.sh 2>/dev/null
+    load_makepkg_config 2>/dev/null
+    echo -e "\n${lightblue}::${NC} Enter Packager name (can be left blank):"
+    read -e -i "${PACKAGER}" packager_name
+    echo "packager = $packager_name" >> .PKGINFO
+fi
+
+rpm_arch=$(rpm_query "$package_with_full_path" '%{ARCH}')
+case "$rpm_arch" in
+    x86_64)              arch="x86_64" ;;
+    i386|i486|i586|i686) arch="i686" ;;
+    aarch64|arm64)       arch="aarch64" ;;
+    armv7hl|armhfp)      arch="armv7h" ;;
+    armv6hl)             arch="armv6h" ;;
+    noarch)              arch="any" ;;
+    *)                   arch="$rpm_arch" ;;
+esac
+echo "arch = $arch" >> .PKGINFO
+echo "size = $(du -sb --exclude='.PKGINFO' . 2>/dev/null | awk '{print $1}')" >> .PKGINFO
+
+if [[ $quiet == set ]] || [[ $Quiet == set ]]; then
+    rpm_license=$(rpm_query "$package_with_full_path" '%{LICENSE}')
+    [[ "$rpm_license" == "(none)" ]] && rpm_license="custom"
+    echo "license = $rpm_license" >> .PKGINFO
+else
+    rpm_license=$(rpm_query "$package_with_full_path" '%{LICENSE}')
+    echo -e "\n${lightblue}::${NC} Enter package license (RPM reports: ${rpm_license}) — can be left blank:"
+    read package_license
+    [[ -z "$package_license" ]] && package_license="$rpm_license"
+    for i in $(echo "$package_license" | sed -e 's/ /__/g' -e 's/,/ /g'); do
+        license+=($i)
+    done
+    printf '%s\n' "${license[@]}" | while read line; do
+        echo "license = $line" >> .PKGINFO
+    done
+fi
+
+echo -e "\n${lightgreen}***${NC} ${bold}Translating dependencies via ${AI_PROVIDER} AI...${normal}"
+
+# --- ЗМІНА 3: очищаємо маппінг-файл перед усіма викликами parse_rpm_dep_field ---
+rm -f "${working_directory}/dep-mapping.txt"
+# ---------------------------------------------------------------------------------
+
+if rpm -qp --obsoletes "$package_with_full_path" 2>/dev/null | grep -qv '^$'; then
+    mapfile -t repl_lines < <(parse_rpm_dep_field "--obsoletes" "replacements")
+    for i in "${repl_lines[@]}"; do [[ -n "$i" ]] && echo "replaces = $i" >> .PKGINFO; done
+fi
+touch replacements-untranslated-names-only
+
+if rpm -qp --conflicts "$package_with_full_path" 2>/dev/null | grep -qv '^$'; then
+    mapfile -t conf_lines < <(parse_rpm_dep_field "--conflicts" "conflicts")
+    for i in "${conf_lines[@]}"; do [[ -n "$i" ]] && echo "conflict = $i" >> .PKGINFO; done
+fi
+touch conflicts-untranslated-names-only
+
+if rpm -qp --provides "$package_with_full_path" 2>/dev/null | grep -qv '^$'; then
+    mapfile -t prov_lines < <(parse_rpm_dep_field "--provides" "provisions")
+    for i in "${prov_lines[@]}"; do [[ -n "$i" ]] && echo "provides = $i" >> .PKGINFO; done
+fi
+touch provisions-untranslated-names-only
+
+if [[ -s conffiles_list ]]; then
+    while read -r i; do [[ -n "$i" ]] && echo "backup = $i" >> .PKGINFO; done < conffiles_list
+fi
+rm -f conffiles_list
+
+if rpm -qp --requires "$package_with_full_path" 2>/dev/null | grep -qv '^$'; then
+    mapfile -t dep_lines < <(parse_rpm_dep_field "--requires" "dependencies")
+    for i in "${dep_lines[@]}"; do [[ -n "$i" ]] && echo "depend = $i" >> .PKGINFO; done
+fi
+touch dependencies-untranslated-names-only
+
+_has_recommends=false
+rpm -qp --recommends "$package_with_full_path" 2>/dev/null | grep -qv '^$' && _has_recommends=true
+rpm -qp --suggests   "$package_with_full_path" 2>/dev/null | grep -qv '^$' && _has_recommends=true
+
+if [[ "$_has_recommends" == true ]]; then
+    {
+        rpm -qp --recommends "$package_with_full_path" 2>/dev/null
+        rpm -qp --suggests   "$package_with_full_path" 2>/dev/null
+    } | grep -v '\.so\b\|\.so\.' \
+      | grep -v '^rpmlib\|^config(\|^rtld(\|^(none)' \
+      | grep -v '^kernel-\|debuginfo\|^ld-linux' \
+      | grep -v '^/bin/\|^/usr/bin/python\|^/usr/bin/perl' \
+      | sort -u > optional-dependencies-initial-check-list
+
+    packages-names-translator
+
+    if [[ -s final-check-list ]]; then
+        while IFS= read -r i; do
+            dep_name=$(echo "$i" | sed 's/[=><].*//')
+            if ! grep -q "^depend = ${dep_name}$\|^depend = ${dep_name}[=><]" .PKGINFO 2>/dev/null; then
+                [[ -n "$i" ]] && echo "optdepend = $i" >> .PKGINFO
+            fi
+        done < final-check-list
+    fi
+    rm -f optional-dependencies-initial-check-list final-check-list
+fi
+touch optional-dependencies-untranslated-names-only-1
+
+rm -rf /tmp/debtap 2>/dev/null
+mkdir /tmp/debtap 2>/dev/null
+mv *untranslated* /tmp/debtap 2>/dev/null
+mv *missing-files /tmp/debtap 2>/dev/null
+
+for f in \
+    "/tmp/debtap/dependencies-untranslated-names-only:depend" \
+    "/tmp/debtap/optional-dependencies-untranslated-names-only-1:optdepend" \
+    "/tmp/debtap/replacements-untranslated-names-only:replaces" \
+    "/tmp/debtap/conflicts-untranslated-names-only:conflict" \
+    "/tmp/debtap/provisions-untranslated-names-only:provides"; do
+    path="${f%%:*}"
+    field="${f##*:}"
+    if [[ -s "$path" ]]; then
+        echo -e "\n${lightred}Warning: These ${field} packages could not be translated to Arch Linux names:${NC}"
+        cat "$path" | tr '\n' ',' | sed 's/,$/\n/' | sed 's/,/, /g'
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Generate .INSTALL file from RPM scriptlets
+# ---------------------------------------------------------------------------
+echo -e "\n${lightgreen}==>${NC} ${bold}Checking and generating .INSTALL file (if necessary)...${normal}"
+
+sanitize_maintainer_script() {
+    local infile="$1"
+    local action="$2"
+
+    [[ ! -f "$infile" ]] && return 0
+    [[ ! -s "$infile" ]] && return 0
+
+    python3 - "$infile" "$action" << 'PYEOF'
+import sys, re
+
+infile  = sys.argv[1]
+action  = sys.argv[2]
+
+with open(infile, 'r', errors='replace') as f:
+    raw = f.read()
+
+lines = raw.splitlines()
+
+HEADER_PAT = re.compile(
+    r'#!|set\s+-e|automatically\s+generated|added\s+by\s+|'
+    r'how this script works',
+    re.IGNORECASE
+)
+
+RPM_TOOLS = re.compile(
+    r'\b(rpm\b|yum\b|dnf\b|zypper\b|urpmi\b|apt(?:-get)?|'
+    r'systemctl\s+daemon-reload|chkconfig|update-rc\.d|'
+    r'/sbin/ldconfig\b|/usr/sbin/ldconfig\b|'
+    r'gtk-update-icon-cache|update-desktop-database|'
+    r'update-mime-database|glib-compile-schemas|'
+    r'depmod\b|ldconfig\b|mandb\b|'
+    r'getent\b|useradd\b|userdel\b|groupadd\b|groupdel\b|'
+    r'usermod\b|groupmod\b)\b',
+    re.IGNORECASE
+)
+
+PATH_FIXES = [
+    (r'(?<!/usr)/bin/',   '/usr/bin/'),
+    (r'(?<!/usr)/sbin/',  '/usr/bin/'),
+    (r'\b/usr/sbin/',     '/usr/bin/'),
+    (r'(?<!/usr)/lib/',   '/usr/lib/'),
+    (r'(?<!/usr)/lib64/', '/usr/lib/'),
+]
+
+def fix_paths(line):
+    for pat, repl in PATH_FIXES:
+        line = re.sub(pat, repl, line)
+    return line
+
+out = []
+for line in lines:
+    if HEADER_PAT.search(line): continue
+    if RPM_TOOLS.search(line):  continue
+    stripped = line.strip()
+    if stripped.startswith('#') or stripped == '': continue
+    line = fix_paths(line)
+    out.append(line)
+
+IF_OPEN  = re.compile(r'^\s*(if|elif)\b')
+FI_PAT   = re.compile(r'^\s*fi\b')
+CASE_O   = re.compile(r'^\s*case\b')
+ESAC_C   = re.compile(r'^\s*esac\b')
+FOR_W_U  = re.compile(r'^\s*(for|while|until)\b')
+DONE_PAT = re.compile(r'^\s*done\b')
+
+if_depth = case_depth = loop_depth = 0
+for l in out:
+    if IF_OPEN.search(l):  if_depth   += 1
+    if FI_PAT.search(l):   if_depth   -= 1
+    if CASE_O.search(l):   case_depth += 1
+    if ESAC_C.search(l):   case_depth -= 1
+    if FOR_W_U.search(l):  loop_depth += 1
+    if DONE_PAT.search(l): loop_depth -= 1
+
+if if_depth != 0 or case_depth != 0 or loop_depth != 0:
+    sys.exit(0)
+
+for l in out:
+    print('\t' + l.rstrip())
+PYEOF
+}
+
+_build_install_func() {
+    local func_name="$1"
+    local script_file="$2"
+    local action="$3"
+
+    local body
+    body=$(sanitize_maintainer_script "$script_file" "$action")
+    if [[ -n "$body" ]]; then
+        printf '\n%s() {\n%s\n}\n' "$func_name" "$body"
+    fi
+}
+
+{
+    _build_install_func "pre_install"  "preinst"  "install"
+    _build_install_func "post_install" "postinst"  "configure"
+    _build_install_func "pre_remove"   "prerm"    "remove"
+    _build_install_func "post_remove"  "postrm"   "remove"
+} > _install_tmp
+
+if grep -q '^pre_install()' _install_tmp 2>/dev/null; then
+    printf '\npre_upgrade() {\n\tpre_install\n}\n' >> _install_tmp
+fi
+if grep -q '^post_install()' _install_tmp 2>/dev/null; then
+    printf '\npost_upgrade() {\n\tpost_install\n}\n' >> _install_tmp
+fi
+
+if grep -q '()' _install_tmp 2>/dev/null && [[ -s _install_tmp ]]; then
+    sed '/./,$!d' _install_tmp > .INSTALL
+fi
+rm -f _install_tmp preinst postinst prerm postrm
+
+# ---------------------------------------------------------------------------
+# Generate .MTREE
+# ---------------------------------------------------------------------------
+echo -e "\n${lightgreen}==>${NC} ${bold}Generating .MTREE file...${normal}"
+bsdtar -czf .MTREE --format=mtree \
+    --options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
+    * .PKGINFO .INSTALL 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# Prompt user for editing
+# ---------------------------------------------------------------------------
+if [[ $Quiet != set ]]; then
+    if [[ -e .INSTALL ]]; then
+        echo -en "\n${lightblue}::${NC} ${bold}Edit .PKGINFO and .INSTALL? (1) vi  (2) nano  (3) default editor  (4) custom  or any key to skip: ${normal}"
+    else
+        echo -en "\n${lightblue}::${NC} ${bold}Edit .PKGINFO? (1) vi  (2) nano  (3) default editor  (4) custom  or any key to skip: ${normal}"
+    fi
+    read -n 1 number; echo
+    case "$number" in
+        1) vi .PKGINFO; [[ -e .INSTALL ]] && vi .INSTALL ;;
+        2) nano .PKGINFO; [[ -e .INSTALL ]] && nano .INSTALL ;;
+        3) ${EDITOR:-vi} .PKGINFO; [[ -e .INSTALL ]] && ${EDITOR:-vi} .INSTALL ;;
+        4) echo -en "${lightblue}::${NC} Custom editor command: "; read custom_editor
+           $custom_editor .PKGINFO; [[ -e .INSTALL ]] && $custom_editor .INSTALL ;;
+    esac
+fi
+
+# ── Dependencies Edit Window ──────────────────────────────────────────
+DEPS_SIGNAL_FILE="$HOME/.cache/LinuxAppInstallerConfig/deps_edit_request.json"
+DEPS_RESULT_FILE="$HOME/.cache/LinuxAppInstallerConfig/deps_edit_result.json"
+
+if [[ "$SHOW_DEPS_WINDOW" == "1" ]]; then
+    rm -f "$DEPS_RESULT_FILE"
+    MY_LOCK_NUMBER="${INSTALLER_LOCK_NUMBER:-0}"
+
+python3 - << 'PYEOF'
+import json, os, re
+
+# Читаємо метадані з RPM через .PKGINFO (control-файлу немає в RPM)
+pkginfo_text = ""
+if os.path.exists(".PKGINFO"):
+    with open(".PKGINFO") as f:
+        pkginfo_text = f.read()
+
+# --- ЗМІНА 2: завантажуємо маппінг збережений під час трансляції ---
+dep_mapping = {}
+mapping_path = os.path.join(os.getcwd(), "dep-mapping.txt")
+if os.path.exists(mapping_path):
+    with open(mapping_path) as mf:
+        for mline in mf:
+            mline = mline.strip()
+            if not mline:
+                continue
+            parts = mline.split("=", 1)
+            if len(parts) == 2:
+                dep_mapping[parts[0]] = parts[1]
+# -------------------------------------------------------------------
+
+translated = {}
+field_map = {
+    "depend":    "Depends",
+    "optdepend": "Recommends",
+    "replaces":  "Replaces",
+    "conflict":  "Conflicts",
+    "provides":  "Provides",
+}
+for line in pkginfo_text.splitlines():
+    for key, label in field_map.items():
+        if line.startswith(key + " = "):
+            val = line.split(" = ", 1)[1].strip()
+            translated.setdefault(label, []).append(val)
+
+# Для RPM немає control-файлу, тому orig_deps беремо безпосередньо
+# з dep_mapping (ключі — оригінальні RPM-назви)
+# Групуємо маппінг за полями з .PKGINFO
+pkginfo_field_to_label = {
+    "depend":    "Depends",
+    "optdepend": "Recommends",
+    "replaces":  "Replaces",
+    "conflict":  "Conflicts",
+    "provides":  "Provides",
+}
+
+# Збираємо оригінальні RPM-назви з dep_mapping (ключі маппінгу)
+# і зіставляємо з полями .PKGINFO через translated значення
+result = []
+
+for pkgkey, label in pkginfo_field_to_label.items():
+    trans_deps = translated.get(label, [])
+    if not trans_deps:
+        continue
+
+    pairs_list = []
+
+    # --- ЗМІНА 2: використовуємо маппінг замість порядкового зіставлення ---
+    # Будуємо зворотній маппінг: arch_base_name -> (rpm_orig, full_arch_line)
+    reverse_map = {}
+    for rpm_orig, arch_line in dep_mapping.items():
+        arch_base = re.sub(r'[>=<].*', '', arch_line).strip()
+        reverse_map[arch_base] = (rpm_orig, arch_line)
+
+    for t_dep in trans_deps:
+        t_base = re.sub(r'[>=<].*', '', t_dep).strip()
+        if t_base in reverse_map:
+            rpm_orig, arch_line = reverse_map[t_base]
+            pairs_list.append({"o": rpm_orig, "t": arch_line})
+        else:
+            # Пакет вже був Arch-назвою або не знайшли у маппінгу — показуємо як є
+            pairs_list.append({"o": t_dep, "t": t_dep})
+    # -----------------------------------------------------------------------
+
+    if not pairs_list:
+        continue
+
+    result.append({"key": label, "value": json.dumps(pairs_list)})
+
+import sys as _sys
+lock_number = os.environ.get("INSTALLER_LOCK_NUMBER", "0")
+out_path = os.path.expanduser("~/.cache/LinuxAppInstallerConfig/deps_edit_request.json")
+with open(out_path, "w") as f:
+    json.dump({"lock_number": lock_number, "deps": result}, f)
+print(f"Written {len(result)} dependency fields to {out_path}")
+PYEOF
+
+    echo -e "\n${lightblue}::${NC} Waiting for user to edit dependencies..."
+
+    while [[ ! -f "$DEPS_RESULT_FILE" ]]; do
+        sleep 0.5
+    done
+
+    if [[ -f "$DEPS_RESULT_FILE" ]]; then
+        RESULT_CONTENT=$(cat "$DEPS_RESULT_FILE" | tr -d '[:space:]')
+        if [[ "$RESULT_CONTENT" == "[]" ]]; then
+            echo -e "${lightblue}   ::${NC} Dependencies translation skipped by user."
+            rm -f "$DEPS_RESULT_FILE"
+        else
+            echo -e "${lightgreen}   ::${NC} Applying edited dependencies..."
+
+            python3 - << 'PYEOF'
+import json, os
+
+result_path = os.path.expanduser('~/.cache/LinuxAppInstallerConfig/deps_edit_result.json')
+with open(result_path) as f:
+    edited = json.load(f)
+
+key_map = {
+    'Depends':    'depend',
+    'Recommends': 'optdepend',
+    'Replaces':   'replaces',
+    'Conflicts':  'conflict',
+    'Provides':   'provides',
+}
+
+with open('.PKGINFO') as f:
+    lines = f.readlines()
+
+keep_keys = set(key_map.values())
+filtered = [l for l in lines if not any(l.startswith(k + ' = ') for k in keep_keys)]
+
+new_lines = []
+for item in edited:
+    pkgkey = key_map.get(item['key'])
+    if not pkgkey:
+        continue
+    try:
+        pairs = json.loads(item['value'])
+        for pair in pairs:
+            dep = pair.get('t', '').strip()
+            if dep:
+                new_lines.append(f"{pkgkey} = {dep}\n")
+    except (json.JSONDecodeError, TypeError):
+        for dep in item['value'].split(','):
+            dep = dep.strip()
+            if dep:
+                new_lines.append(f"{pkgkey} = {dep}\n")
+
+with open('.PKGINFO', 'w') as f:
+    f.writelines(filtered + new_lines)
+
+os.remove(result_path)
+print("Dependencies updated in .PKGINFO")
+PYEOF
+        fi
+    fi
+fi  # end of SHOW_DEPS_WINDOW
+# ──────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Create final package
+# ---------------------------------------------------------------------------
+if [[ $Pkgbuild != set ]]; then
+    echo -e "\n${lightgreen}==>${NC} ${bold}Creating final package...${normal}"
+    fakeroot << EOF
+tar --force-local -pcf \
+    $(grep '^pkgname =' .PKGINFO | gawk '{print $3}')-$(grep '^pkgver =' .PKGINFO | gawk '{print $3}')-$(grep '^arch =' .PKGINFO | gawk '{print $3}').pkg.tar \
+    --exclude='pkgbuildinstallations*' * .PKGINFO .INSTALL .MTREE 2>/dev/null
+zstd -q -T0 --ultra -15 *.tar
+EOF
+    dest_dir="$(dirname "$package_with_full_path")"
+    [[ $output == set ]] && dest_dir="$outputdirectory"
+    mv *.zst "$dest_dir" || {
+        echo -e "${red}Error: Cannot move package to destination, permission denied.${NC}"; exit 1
+    }
+    echo -e "${lightgreen}==>${NC} ${bold}Package successfully created!${normal}"
+fi
+
+# ---------------------------------------------------------------------------
+# Generate PKGBUILD (if requested)
+# ---------------------------------------------------------------------------
+if [[ $pkgbuild == set ]] || [[ $Pkgbuild == set ]]; then
+    echo -e "\n${lightgreen}==>${NC} ${bold}Generating PKGBUILD file...${normal}"
+    {
+        echo "# Generated by rpmtap (AI mode)"
+        echo "# Maintainer: $(grep '^packager =' .PKGINFO | gawk '{print $3}')"
+        echo "pkgname=$(grep '^pkgname =' .PKGINFO | gawk '{print $3}')"
+        echo "pkgver=$(grep '^pkgver =' .PKGINFO | gawk '{print $3}' | sed 's/-[^-]*$//')"
+        echo "pkgrel=$(grep '^pkgver =' .PKGINFO | gawk '{print $3}' | grep -o '[^-]*$')"
+        echo "pkgdesc=\"$(grep '^pkgdesc =' .PKGINFO | cut -d= -f2- | sed 's/^ //')\""
+        echo "arch=('$(grep '^arch =' .PKGINFO | gawk '{print $3}')')"
+        echo "url=\"$(grep '^url =' .PKGINFO | cut -d= -f2- | sed 's/^ //')\""
+        echo "license=('$(grep '^license =' .PKGINFO | gawk '{print $3}' | tr '\n' "'" | sed "s/'$//;s/'/' '/g")')"
+        deps=$(grep '^depend =' .PKGINFO | gawk '{print $3}' | tr '\n' ' ')
+        [[ -n "$deps" ]] && echo "depends=($(echo $deps | sed "s/\([^ ]*\)/'\1'/g"))"
+        odeps=$(grep '^optdepend =' .PKGINFO | gawk '{print $3}' | tr '\n' ' ')
+        [[ -n "$odeps" ]] && echo "optdepends=($(echo $odeps | sed "s/\([^ ]*\)/'\1'/g"))"
+        echo "options=('!strip' '!emptydirs')"
+        echo "source=(\"PUT_FULL_URL_HERE\")"
+        echo "sha512sums=('$(sha512sum "$package_with_full_path" | gawk '{print $1}')')"
+        echo ""
+        echo "package() {"
+        echo "    rpm2cpio \"\$srcdir/$(basename "$package_with_full_path")\" | cpio --extract --make-directories -D \"\${pkgdir}\""
+        echo "}"
+    } > PKGBUILD
+
+    pkgname_val="$(grep '^pkgname=' PKGBUILD | sed 's/^pkgname=//')"
+    dest_dir="$(dirname "$package_with_full_path")"
+    [[ $output == set ]] && dest_dir="$outputdirectory"
+    pkgbuild_location="$dest_dir/$pkgname_val-PKGBUILD"
+    rm -rf "$pkgbuild_location"; mkdir "$pkgbuild_location"
+    mv PKGBUILD "$pkgbuild_location/"
+    [[ -e .INSTALL ]] && mv .INSTALL "$pkgbuild_location/$pkgname_val.install"
+    echo -e "${lightgreen}==>${NC} ${bold}PKGBUILD ready in ${lightblue}\"$pkgbuild_location\"${NC}${normal}"
+fi
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+echo -e "${lightgreen}==>${NC} ${bold}Removing leftover files...${normal}"
+rm -rf "$working_directory"
+rm -rf /tmp/debtap
+
+if [[ -f /tmp/debtap-ai-auth-error ]]; then
+    rm -f /tmp/debtap-ai-auth-error
+    echo "DEBTAP_AI_AUTH_ERROR" >&2
+    exit 3
+fi
+
+if [[ -f /tmp/debtap-no-token ]]; then
+    rm -f /tmp/debtap-no-token
+    exit 3
+fi
+
+exit 0
