@@ -2,7 +2,7 @@
 
 ### LinuxPackageInstaller/Converter
 
-Arch Linux graphical open-source utility that helps you install `.deb`, `.rpm` and even tarball packages.
+Arch Linux graphical open-source utility that helps you install `.deb`, `.rpm`, `.appimage`, `flatpak` and even `tarball` packages.
 
 <br clear="left"/>
 
