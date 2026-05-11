@@ -1,6 +1,6 @@
 <img src="https://raw.githubusercontent.com/Nazarchykushka/LinuxPackageInstaller/main/logo/logo120.png" width="100" align="left" hspace="16"/>
 
-### Linux Package Installer/Converter
+### LinuxPackageInstaller/Converter
 
 Arch Linux graphical open-source utility that helps you install `.deb`, `.rpm` and even tarball packages.
 
@@ -45,7 +45,7 @@ Arch Linux graphical open-source utility that helps you install `.deb`, `.rpm` a
 
 This video demonstrates what the program installation looks like.
 
-It uses [debtap](https://github.com/helixarch/debtap) and rpmtap (modified debtap) scripts to convert Debian packages to Arch and install them, so you can later delete all installed packages (including tarballs) just with the `pacman` utility. The `.deb` and `.rpm` packages include dependency packages which are installed on their native distributions. But on Arch they have different names, so the [debtap](https://github.com/helixarch/debtap) author created logic to translate Debian packages to Arch, which does not always works correctly. The Linux Package Installer author decided to use AI to translate packages. You need to enter your provider (for now) in settings. It is recommended to enter a model which has internet access. **This program supports [OpenRouter](https://openrouter.ai), [Hugging Face](https://huggingface.co), [Mistral](https://mistral.ai), [OpenAI](https://platform.openai.com), [Gemini](https://aistudio.google.com) tokens.** AI is also used for the description, program name (the program itself does it, but not always correctly) and category. You can still use the program without AI, but then you will need to enter dependencies manually.
+It uses [debtap](https://github.com/helixarch/debtap) and rpmtap (modified debtap) scripts to convert Debian packages to Arch and install them, so you can later delete all installed packages (including tarballs) just with the `pacman` utility. The `.deb` and `.rpm` packages include dependency packages which are installed on their native distributions. LinuxPackageInstaller author decided to use AI to translate packages. Modified [debtap](https://github.com/helixarch/debtap) script was used for that. You need to enter your provider (for now) in settings. It is recommended to enter a model which has internet access. **This program supports [OpenRouter](https://openrouter.ai), [Hugging Face](https://huggingface.co), [Mistral](https://mistral.ai), [OpenAI](https://platform.openai.com), [Gemini](https://aistudio.google.com) tokens.** AI is also used for the description, program name (the program itself does it, but not always correctly) and category. You can still use the program without AI, but then you will need to enter dependencies manually.
 
 ---
 
