@@ -43,7 +43,7 @@ Arch Linux graphical open-source utility that helps you install `.deb`, `.rpm`, 
 
 ![Demonstration](https://raw.githubusercontent.com/Nazarchykushka/LinuxPackageInstaller/main/demonstrationvideo.gif)
 
-This video demonstrates what the program installation looks like.
+This video demonstrates how the program installation looks like.
 
 It uses [debtap](https://github.com/helixarch/debtap) and rpmtap (modified debtap) scripts to convert Debian packages to Arch and install them, so you can later delete all installed packages (including tarballs) just with the `pacman` utility. The `.deb` and `.rpm` packages include dependency packages which are installed on their native distributions. LinuxPackageInstaller author decided to use AI to translate packages. Modified [debtap](https://github.com/helixarch/debtap) script was used for that. You need to enter your provider (for now) in settings for script to work. It is recommended to enter a model which has internet access. **This program supports [OpenRouter](https://openrouter.ai), [Hugging Face](https://huggingface.co), [Mistral](https://mistral.ai), [OpenAI](https://platform.openai.com), [Gemini](https://aistudio.google.com) tokens.** AI is also used for the description, program name (the program itself does it, but not always correctly) and category when installing tarbolls. You can still use the program without AI, but then you will need to enter dependencies manually.
 
